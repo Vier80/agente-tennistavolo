@@ -1,4 +1,21 @@
-"""Agente Tennis Tavolo (versione 1.3 del 19/11/2026, scheda 41)
+"""Agente Tennis Tavolo (versione 1.4 del 19/11/2026, scheda 43)
+
+NOVITÀ della 1.4 (sessione 3: pagina tennistavolo.html). Notion funziona esattamente come nella 1.3.
+  1. TABELLONI UFFICIALI: per ogni torneo l'agente legge dal sito WTT il tabellone di ogni specialità
+     (servizio GetBrackets: ordine delle caselle, teste di serie, qualificati «Q», bye, incontri in
+     programma e, nei tornei in corso, i risultati già giocati) e lo mette in tennistavolo.json,
+     sezione «tabelloni». Anche il tabellone delle QUALIFICAZIONI (sezione «q»).
+     I gironi delle WTT Finals e della World Cup si ricostruiscono dalle righe di Notion
+     (Turno = «Group Stage»), con la classifica calcolata dai risultati.
+     Il tabellone NON va in Notion.
+  2. I tabelloni dei tornei finiti non si rileggono ogni giorno: si riprendono dal tennistavolo.json
+     già pubblicato. Si rileggono solo i tornei in corso, quelli che iniziano entro 7 giorni e quelli
+     non ancora salvati.
+  3. PUBBLICAZIONE: nel lancio vero tennistavolo.json viene salvato nel repository della mappa
+     (map-q-la28, serve il secret MAPPA_TOKEN) e si avvia la ripubblicazione del sito.
+     Senza MAPPA_TOKEN il file resta solo negli Artifacts, come nella 1.3.
+  4. Un tabellone che non si riesce a leggere NON ferma l'agente e non colora di rosso il lancio:
+     compare un «Avviso» e si tiene quello già pubblicato, se c'è.
 
 NOVITÀ della 1.3 (terza «Solo prova»: 9.771 incontri letti): controllo di coerenza su ogni incontro.
   Si scarta, con un avviso, l'incontro in cui la scheda del sito non corrisponde al codice
@@ -37,8 +54,11 @@ Variabili (i «Secrets» e le scelte del workflow di GitHub):
   DRY_RUN=true        prova: legge sito e Notion ma non scrive nulla
   MODALITA            «aggiungi» (normale) o «completa» (rilegge anche i tornei già caricati)
   TEMPO_MAX_MINUTI    dopo quanti minuti smettere di scrivere e chiudere in ordine (predefinito 110)
+  MAPPA_TOKEN         token GitHub che può scrivere su map-q-la28 (novità 1.4; facoltativo:
+                      senza, Notion si aggiorna lo stesso ma la pagina web no)
   WTT_LOCALE          SOLO PER I COLLAUDI: cartella con file già scaricati al posto del sito
 """
+import base64
 import gzip
 import json
 import os
@@ -47,7 +67,7 @@ import sys
 import time
 import zlib
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -129,6 +149,36 @@ ORDINE_TURNI = ["Qualifying Group", "Qualifying Round 1", "Qualifying Round 2", 
 # Esito scritto in fondo al punteggio WTT («3-0 WO») -> testo in «Score»
 ESITI = {"WO": "walkover", "INJ": "ritiro", "RET": "ritiro", "DSQ": "squalifica"}
 
+# ------------------------------------------------------------------ impostazioni dei tabelloni (novità 1.4)
+# Servizio del sito WTT che disegna il «Draw» (verificato dal browser il 19/11/2026):
+#   GetBrackets/{id torneo}/{codice della specialità lungo 42 caratteri, es. «TTEMSINGLES» + 31 trattini}
+# Risponde 204 (nessun contenuto) se quella specialità non ha tabellone (es. doppi dei Champions).
+WTT_API = "https://wtt-website-api-vm-frontdoor-hhaec5epbhdyfugz.a01.azurefd.net/liveeventsapi/api/cms"
+CODICE_SPEC = {"MS": "TTEMSINGLES", "WS": "TTEWSINGLES", "MD": "TTEMDOUBLES", "WD": "TTEWDOUBLES",
+               "XD": "TTEXDOUBLES"}
+# codice del turno nel tabellone del sito -> sigla nella pagina (le qualificazioni RND1, RND2... -> Q1, Q2...)
+SIGLA_TURNO = {"R128": "R128", "R64-": "R64", "R32-": "R32", "8FNL": "R16", "QFNL": "QF", "SFNL": "SF",
+               "FNL-": "Final"}
+GIORNI_ANTICIPO_TABELLONE = 7     # il tabellone esce qualche giorno prima dell'inizio del torneo
+# Incontri attesi quando il tabellone non c'è (solo per l'anello della pagina; stime)
+ATTESI_PREDEFINITI = {"Smash": 300, "Champions": 62, "Star Contender": 250, "Contender": 200,
+                      "WTT Finals": 45, "Mondiali": 440, "World Cup": 126}
+# Formato di una casella del tabellone in tennistavolo.json (una lista, per occupare poco spazio),
+# identico a badminton.json:
+#   [colonna, posizione, squadra_a, testa_a, squadra_b, testa_b, vincitore, stato, esito, set, data]
+#   - colonna: 0 = primo turno; nei gironi colonna = giornata; posizione: 0 = in alto;
+#   - squadra_a / squadra_b: numero nell'elenco «squadre» del torneo, -1 = vuota (bye o da definire);
+#   - testa_a / testa_b: testa di serie («1»), «Q» = arrivato dalle qualificazioni, oppure «»;
+#   - vincitore: 1 = squadra_a, 2 = squadra_b, 0 = da giocare;
+#   - stato: «F» = finito, «N» = da giocare;
+#   - esito: «» (normale), «walkover», «ritiro», «squalifica»;
+#   - set: le partite dal punto di vista di squadra_a, es. «11-7 9-11 11-5 11-8»;
+#   - data: giorno dell'incontro (AAAA-MM-GG) o «».
+CAMPI_CASELLA = ["colonna", "posizione", "squadra_a", "testa_a", "squadra_b", "testa_b",
+                 "vincitore", "stato", "esito", "set", "data"]
+MAPPA_REPO = "vier80/map-q-la28"     # repository della mappa (pagine web)
+MAPPA_WORKFLOW = "aggiorna.yml"      # workflow che ripubblica il sito
+
 # Variabili d'ambiente
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
 _grezzo = os.getenv("NOTION_DATABASE_ID", "").strip().replace("-", "")
@@ -139,6 +189,8 @@ MODALITA = (os.getenv("MODALITA", "") or "aggiungi").strip().lower()
 TEMPO_MAX = float(os.getenv("TEMPO_MAX_MINUTI", "") or 110) * 60
 WTT_LOCALE = os.getenv("WTT_LOCALE", "").strip()
 FILE_WEB = "tennistavolo.json"
+MAPPA_TOKEN = os.getenv("MAPPA_TOKEN", "").strip()       # novità 1.4
+VERSIONE = "1.4"
 
 NOTION_HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28",
                   "Content-Type": "application/json"}
@@ -576,9 +628,359 @@ def scrivi_riga(mappa, riga):
     notion("POST", "/pages", json={"parent": {"database_id": DATABASE_ID}, "properties": props})
 
 
+# ------------------------------------------------------------------ tabelloni ufficiali (novità 1.4)
+class Squadre:
+    """Elenco delle squadre (giocatori o coppie) di un torneo: ognuna una volta sola.
+
+    Ogni squadra è [nome, NOC, codice ITTF]; nelle caselle del tabellone si scrive solo il suo numero.
+    Il codice ITTF di una coppia è quello delle righe di Notion: i due codici in ordine crescente
+    separati da «/» (es. «132992/135977»). Serve alla pagina per trovare l'ELO.
+    """
+
+    def __init__(self, lista=None):
+        self.lista, self.indice = [], {}
+        for s in lista or []:                    # elenco già pubblicato (per aggiungere i gironi)
+            self.aggiungi(*s)
+
+    def aggiungi(self, nome, noc, codice):
+        nome = re.sub(r"\s+", " ", nome or "").strip()
+        if not nome:
+            return -1
+        chiave = codice or nome
+        if chiave not in self.indice:
+            self.indice[chiave] = len(self.lista)
+            self.lista.append([nome, noc or "", codice or ""])
+        return self.indice[chiave]
+
+
+def ordina_codici(codici):
+    """Codici ITTF in ordine numerico crescente, uniti con «/» (come nelle colonne ID ITTF 1 e 2)."""
+    codici = [str(c).strip() for c in codici if str(c or "").strip()]
+    codici.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+    return "/".join(codici)
+
+
+def squadra_del_tabellone(posto, squadre):
+    """Numero della squadra di un lato di una casella del tabellone (-1 = bye o da definire).
+
+    Il sito scrive Code = «BYE» per il passaggio diretto, «TBD» per l'avversario non ancora noto,
+    «WO»/«INJ» per chi non si è presentato o si è ritirato (ma in quel caso Competitor c'è ancora).
+    """
+    comp = posto.get("Competitor") or {}
+    if "BYE" in {(posto.get("Code") or "").strip().upper(), (comp.get("Organization") or "").strip().upper(),
+                 ((comp.get("Description") or {}).get("TeamName") or "").strip().upper()}:
+        return -1                                       # passaggio diretto (a volte il sito mette un «atleta» BYE)
+    atleti = sorted((comp.get("Composition") or {}).get("Athlete") or [], key=lambda a: a.get("Order") or 0)
+    if not atleti:
+        return -1
+    nomi, nocs, codici = [], [], []
+    for a in atleti:
+        d = a.get("Description") or {}
+        nomi.append(f"{(d.get('FamilyName') or '').strip()} {(d.get('GivenName') or '').strip()}".strip())
+        noc = (d.get("Organization") or "").strip()
+        if noc and noc not in nocs:
+            nocs.append(noc)
+        codici.append(d.get("IfId") or a.get("Code") or "")
+    noc = "/".join(nocs) or (comp.get("Organization") or "").strip()
+    return squadre.aggiungi(" / ".join(n for n in nomi if n), noc, ordina_codici(codici))
+
+
+def testa_di_serie(posto, teste_vere):
+    """Testa di serie da mostrare: il numero solo se è davvero una testa di serie.
+    Il sito dà un numero a tutti (è la posizione d'ingresso): conta solo se ≤ NoOfSeeds del tabellone.
+    «Q» = giocatore arrivato dalle qualificazioni (QualifierType «Q» o «q»)."""
+    comp = posto.get("Competitor") or {}
+    try:
+        seme = int(comp.get("Seed") or 0)
+    except (TypeError, ValueError):
+        seme = 0
+    if 0 < seme <= teste_vere:
+        return str(seme)
+    if (comp.get("QualifierType") or "").upper() == "Q":
+        return "Q"
+    return ""
+
+
+def partite_del_tabellone(risultato):
+    """«3-1 (11:7,9:11,11:5,11:8,0:0)» -> [(11, 7), (9, 11), (11, 5), (11, 8)] (tolte le partite 0:0)."""
+    m = re.search(r"\((.*)\)", risultato or "")
+    lista = []
+    for pezzo in (m.group(1) if m else "").split(","):
+        x = re.match(r"\s*(\d+)\s*[:\-]\s*(\d+)\s*$", pezzo)
+        if x and (int(x.group(1)), int(x.group(2))) != (0, 0):
+            lista.append((int(x.group(1)), int(x.group(2))))
+    return lista
+
+
+def casella_del_tabellone(colonna, voce, squadre, teste_vere):
+    """Una casella del tabellone nel formato di CAMPI_CASELLA. Il lato con Pos = 1 è squadra_a."""
+    posti = sorted(voce.get("CompetitorPlace") or [], key=lambda c: c.get("Pos") or 0)[:2]
+    while len(posti) < 2:
+        posti.append({})
+    lati = [squadra_del_tabellone(c, squadre) for c in posti]
+    teste = [testa_di_serie(c, teste_vere) if lati[i] >= 0 else "" for i, c in enumerate(posti)]
+    wlt = [(c.get("Wlt") or "").upper() for c in posti]
+    vincitore = 1 if wlt[0] == "W" else 2 if wlt[1] == "W" else 0
+    giochi = partite_del_tabellone(voce.get("Result"))       # dal punto di vista di Pos 1 (verificato)
+    esito = ""
+    irm = {(c.get("Irm") or "").upper() for c in posti} - {"", "OK"}
+    if vincitore and irm:
+        if "WO" in irm:                       # non presentato: le partite 11-0 sono riempitivo
+            esito, giochi = "walkover", []
+        elif irm & {"INJ", "RET"}:            # ritiro: tolgo le partite di riempitivo in fondo
+            giochi = togli_riempitivo(giochi)
+            esito = "ritiro" if giochi else "walkover"
+        elif "DSQ" in irm:
+            esito = "squalifica"
+        else:
+            esito = sorted(irm)[0].lower()
+    try:
+        posizione = int(voce.get("Position") or voce.get("Order") or 1) - 1
+    except (TypeError, ValueError):
+        posizione = 0
+    return [colonna, posizione, lati[0], teste[0], lati[1], teste[1], vincitore,
+            "F" if vincitore else "N", esito, " ".join(f"{a}-{b}" for a, b in giochi),
+            (voce.get("Date") or "")[:10]]
+
+
+def eliminazione(blocco, squadre):
+    """Un tabellone a eliminazione diretta (principale o qualificazioni): {"misura", "turni", "c"}.
+    Le colonne vanno dal turno più numeroso (colonna 0) alla finale."""
+    turni = [t for t in blocco.get("BracketItems") or [] if t.get("BracketItem")]
+    turni.sort(key=lambda t: -len(t["BracketItem"]))
+    teste_vere = int(blocco.get("NoOfSeeds") or 0)
+    caselle, sigle = [], []
+    for colonna, t in enumerate(turni):
+        codice = (t.get("Code") or "").strip()
+        sigle.append(SIGLA_TURNO.get(codice) or ("Q" + codice[3:].rstrip("-") if codice.startswith("RND")
+                                                  else codice.rstrip("-")))
+        for voce in t["BracketItem"]:
+            caselle.append(casella_del_tabellone(colonna, voce, squadre, teste_vere))
+    caselle.sort(key=lambda c: (c[0], c[1]))
+    return {"misura": 2 * len(turni[0]["BracketItem"]) if turni else 0, "turni": sigle, "c": caselle}
+
+
+def scarica_tabellone(evento, spec):
+    """Dati di GetBrackets per un torneo e una specialità.
+    None = il sito non ha quel tabellone (204 o 404, es. i doppi dei Champions);
+    SitoRifiuta = il sito ha risposto in altro modo (403, 5xx, rete)."""
+    if WTT_LOCALE:                                       # collaudi: file br_{id}_{MSINGLES...}.json
+        percorso = os.path.join(WTT_LOCALE, f"br_{evento}_{CODICE_SPEC[spec][3:]}.json")
+        if not os.path.exists(percorso):
+            return None
+        with open(percorso, encoding="utf-8") as f:
+            dati = json.load(f)
+        return dati if isinstance(dati, dict) and dati.get("Competition") else None
+    codice, dati, descrizione = chiedi(f"{WTT_API}/GetBrackets/{evento}/{CODICE_SPEC[spec].ljust(42, '-')}")
+    if codice in (204, 404):
+        return None
+    if codice == 200 and isinstance(dati, dict):
+        return dati if (dati.get("Competition") or {}).get("Bracket") else None
+    if codice == 200 and dati is None and "«»" in descrizione:
+        return None                                      # risposta vuota
+    raise SitoRifiuta(descrizione)
+
+
+def leggi_tabelloni(t):
+    """Tutti i tabelloni di un torneo: {"id", "completo", "attesi", "squadre", "spec": {"MS": {...}, ...}}.
+
+    Per ogni specialità:
+      - tabellone a eliminazione: {"tipo": "E", "misura", "turni", "c"};
+      - con gironi (WTT Finals, World Cup): {"tipo": "G", ...} con semifinali/finale o ottavi... in "c";
+        i gironi ("gironi") si aggiungono dopo, dalle righe di Notion (aggiungi_gironi);
+      - qualificazioni a eliminazione, se ci sono: "q": {"misura", "turni", "c"};
+        qualificazioni a gironi: "q_gironi": true (la pagina le mostra solo nell'elenco).
+    "attesi" = incontri che avrà il torneo = TotalMatchesForSubEvent del sito meno i bye.
+    """
+    squadre, spec, attesi = Squadre(), {}, 0
+    for s in ORDINE_SPEC:
+        dati = scarica_tabellone(t["id"], s)
+        if not dati:
+            continue
+        voce = None
+        n = int(dati.get("TotalMatchesForSubEvent") or 0)
+        for blocco in (dati.get("Competition") or {}).get("Bracket") or []:
+            n -= int(blocco.get("NoOfByes") or 0)
+            codice = (blocco.get("Code") or "").upper()
+            if codice == "MAIN":
+                voce = {"tipo": "G" if blocco.get("GroupMatches") else "E", **eliminazione(blocco, squadre)}
+            elif codice == "PREL":
+                if blocco.get("GroupMatches"):
+                    spec.setdefault("_q_gironi", set()).add(s)
+                else:
+                    spec.setdefault("_q", {})[s] = eliminazione(blocco, squadre)
+        if voce:
+            spec[s] = voce
+            attesi += max(n, 0)
+    for s, q in spec.pop("_q", {}).items():
+        if s in spec:
+            spec[s]["q"] = q
+    for s in spec.pop("_q_gironi", set()):
+        if s in spec:
+            spec[s]["q_gironi"] = True
+    if not spec:
+        raise ValueError("nessun tabellone pubblicato")
+    tutte = [c for v in spec.values() for c in v["c"] + (v.get("q") or {}).get("c", [])]
+    completo = bool(tutte) and all(c[7] == "F" for c in tutte)
+    return {"id": t["id"], "completo": completo, "attesi": attesi, "squadre": squadre.lista,
+            "spec": {s: spec[s] for s in ORDINE_SPEC if s in spec}}
+
+
+def tabelloni_aggiornati(tornei, vecchi, oggi):
+    """Tabelloni da mettere in tennistavolo.json, per nome del torneo.
+    Rilegge dal sito solo ciò che può essere cambiato; il resto lo riprende da `vecchi`
+    (la sezione «tabelloni» del tennistavolo.json già pubblicato)."""
+    nuovi, letti, ripresi, rifiuti = {}, 0, 0, 0
+    limite = (oggi + timedelta(days=GIORNI_ANTICIPO_TABELLONE)).isoformat()
+    print("\nTabelloni ufficiali (ordine, teste di serie, qualificazioni):")
+    for t in tornei:
+        if t["inizio"] > limite:
+            continue
+        vecchio = vecchi.get(t["nome"]) if isinstance(vecchi, dict) else None
+        if vecchio and vecchio.get("completo") and vecchio.get("id") == t["id"]:
+            nuovi[t["nome"]] = vecchio                   # torneo finito e già salvato: non lo rileggo
+            ripresi += 1
+            continue
+        if tempo_scaduto():
+            if vecchio:
+                nuovi[t["nome"]] = vecchio
+            avviso(f"{t['nome']}: tabellone non riletto per il limite di tempo")
+            continue
+        try:
+            tab = leggi_tabelloni(t)
+            letti += 1
+            # finito da più di 3 giorni: lo considero chiuso anche se qualche casella è rimasta «da giocare»
+            if t["fine"] < (oggi - timedelta(days=3)).isoformat():
+                tab["completo"] = True
+            nuovi[t["nome"]] = tab
+            print(f"  {t['nome']}: " + ", ".join(
+                f"{s} {'gironi + ' if v['tipo'] == 'G' else ''}{v['misura']}"
+                + (f" (qualif. {v['q']['misura']})" if v.get("q") else "") for s, v in tab["spec"].items()))
+        except SitoRifiuta as e:
+            rifiuti += 1
+            if vecchio:
+                nuovi[t["nome"]] = vecchio
+            avviso(f"{t['nome']}: tabellone non letto, il sito WTT ha risposto {e}"
+                   + ("; tengo quello già pubblicato" if vecchio else ""))
+        except ValueError:
+            if vecchio:
+                nuovi[t["nome"]] = vecchio
+            if t["inizio"] > oggi.isoformat():
+                print(f"  {t['nome']}: tabellone non ancora pubblicato")
+            elif t["categoria"] == "Mondiali":
+                print(f"  {t['nome']}: nessun tabellone individuale (Mondiali a squadre)")
+            else:
+                avviso(f"{t['nome']}: nessun tabellone sul sito WTT")
+        except (KeyError, TypeError, IndexError) as e:
+            if vecchio:
+                nuovi[t["nome"]] = vecchio
+            avviso(f"{t['nome']}: tabellone in un formato inatteso ({type(e).__name__}: {e})")
+    print(f"  Letti dal sito: {letti}; ripresi da {FILE_WEB} già pubblicato: {ripresi}"
+          + (f"; rifiutati dal sito: {rifiuti}" if rifiuti else ""))
+    return nuovi
+
+
+def numero_partite(score):
+    """«3-2 (11-6, 10-12, ...)» -> [(11, 6), (10, 12), ...] dal punto di vista del vincitore (Player 1)."""
+    m = re.search(r"\((.*)\)", score or "")
+    lista = []
+    for pezzo in (m.group(1) if m else "").split(","):
+        x = re.match(r"\s*(\d+)\s*-\s*(\d+)\s*$", pezzo)
+        if x:
+            lista.append((int(x.group(1)), int(x.group(2))))
+    return lista
+
+
+def aggiungi_gironi(tabelloni, righe):
+    """Gironi delle WTT Finals e della World Cup (tabelloni di tipo «G»), ricostruiti dalle righe di Notion.
+
+    Il sito dà nel tabellone solo la fase a eliminazione: gli incontri dei gironi sono in Notion
+    (Turno = «Group Stage»), con il codice del girone nell'ID Univoco («…GP02000600» = girone 2,
+    incontro 6). La classifica è calcolata qui: vittorie, poi differenza partite, poi differenza punti;
+    tra due giocatori pari per vittorie decide lo scontro diretto.
+    Formato di un girone: {"nome", "classifica", "c"}; riga di classifica:
+    [posizione, squadra, giocati, vinti, persi, partite vinte, partite perse, punti fatti, punti subiti,
+     1 se è passato alla fase a eliminazione altrimenti 0].
+    """
+    per_torneo = {}
+    for r in righe:
+        if r.get("turno") != "Group Stage" or (r.get("tabellone") or "Principale") != "Principale":
+            continue
+        parti = (r.get("id") or "").split("|")
+        codice = parti[2] if len(parti) >= 3 else ""
+        m = re.match(r"GP(\d+)(\d{4})", codice[22:30])
+        if not m:
+            continue
+        per_torneo.setdefault((r.get("torneo"), r.get("disciplina")), []).append(
+            (int(m.group(1)), int(m.group(2)), r))
+    for nome, tab in tabelloni.items():
+        for s, voce in (tab.get("spec") or {}).items():
+            voce.pop("gironi", None)
+            if voce.get("tipo") != "G":
+                continue
+            incontri = per_torneo.get((nome, s), [])
+            if not incontri:
+                continue
+            squadre = Squadre(tab.get("squadre"))
+            passati = {c[i] for c in voce.get("c", []) if c[0] == 0 for i in (2, 4) if c[i] >= 0}
+            gironi = {}
+            for g, num, r in incontri:
+                gironi.setdefault(g, []).append((num, r))
+            voce["gironi"] = []
+            for g in sorted(gironi):
+                lista = sorted(gironi[g], key=lambda x: x[0])
+                stat, scontri = {}, {}
+                caselle = []
+                for num, r in lista:
+                    a = squadre.aggiungi(r.get("p1"), r.get("noc1"), r.get("id1"))   # vincitore
+                    b = squadre.aggiungi(r.get("p2"), r.get("noc2"), r.get("id2"))
+                    score = r.get("score") or ""
+                    esito = "" if re.match(r"^\d+-\d+", score) else score.split(" ")[0]   # walkover, ritiro...
+                    giochi = numero_partite(score)
+                    for sq in (a, b):
+                        stat.setdefault(sq, [0, 0, 0, 0, 0, 0, 0])   # giocati, vinti, persi, pv, pp, punti f, punti s
+                    stat[a][0] += 1; stat[a][1] += 1; stat[b][0] += 1; stat[b][2] += 1
+                    for x, y in giochi:
+                        stat[a][3] += x > y; stat[a][4] += y > x; stat[b][3] += y > x; stat[b][4] += x > y
+                        stat[a][5] += x; stat[a][6] += y; stat[b][5] += y; stat[b][6] += x
+                    scontri[(a, b)] = a
+                    scontri[(b, a)] = a
+                    caselle.append([num, a, b, esito, " ".join(f"{x}-{y}" for x, y in giochi), r.get("data", "")])
+                ordine = sorted(stat, key=lambda q: (-stat[q][1], -(stat[q][3] - stat[q][4]), -(stat[q][5] - stat[q][6])))
+                for i in range(len(ordine) - 1):        # due pari per vittorie: decide lo scontro diretto
+                    x, y = ordine[i], ordine[i + 1]
+                    pari = [q for q in ordine if stat[q][1] == stat[x][1]]
+                    if len(pari) == 2 and y in pari and x in pari and scontri.get((x, y)) == y:
+                        ordine[i], ordine[i + 1] = y, x
+                classifica = [[k + 1, q, *stat[q], 1 if q in passati else 0] for k, q in enumerate(ordine)]
+                per_giornata = max(1, len(stat) // 2)
+                righe_c, contatore = [], {}
+                for num, a, b, esito, testo, data in caselle:
+                    giornata = (num - 1) // per_giornata
+                    pos = contatore.get(giornata, 0)
+                    contatore[giornata] = pos + 1
+                    righe_c.append([giornata, pos, a, "", b, "", 1, "F", esito, testo, data])
+                voce["gironi"].append({"nome": f"Girone {g}", "classifica": classifica, "c": righe_c})
+            tab["squadre"] = squadre.lista
+
+
+def incontri_attesi(tab, categoria):
+    """Quanti incontri avrà il torneo (per l'anello della pagina)."""
+    if tab and tab.get("attesi"):
+        return tab["attesi"]
+    return ATTESI_PREDEFINITI.get(categoria, 200)
+
+
 # ------------------------------------------------------------------ file per la pagina web
-def file_web(tornei, righe, oggi):
-    """tennistavolo.json: calendario + tutti gli incontri (formato compatto, come badminton.json)."""
+def file_web(tornei, righe, oggi, tabelloni=None):
+    """tennistavolo.json: calendario + tutti gli incontri + tabelloni (stesso formato di badminton.json).
+
+    Novità 1.4: gli incontri hanno i 9 campi di badminton.json (senza tabellone e codici ITTF, che la
+    pagina non usa: il file resta più leggero); ogni torneo ha "id", "url" e "attesi"; c'è la sezione
+    «tabelloni». Un torneo concluso senza incontri e senza tabelloni individuali (i Mondiali 2026,
+    solo a squadre) non viene messo nella pagina.
+    """
+    tabelloni = tabelloni or {}
     per_torneo = Counter(r.get("torneo", "") for r in righe)
     elenco = []
     for t in tornei:
@@ -588,22 +990,85 @@ def file_web(tornei, righe, oggi):
             stato = "in corso"
         else:
             stato = "concluso"
-        elenco.append({**t, "stato": stato, "incontri": per_torneo.get(t["nome"], 0)})
+        tab = tabelloni.get(t["nome"])
+        if stato == "concluso" and not per_torneo.get(t["nome"]) and not (tab and tab.get("spec")):
+            continue                                       # es. Mondiali 2026 a squadre
+        elenco.append({"nome": t["nome"], "id": t["id"], "categoria": t["categoria"], "inizio": t["inizio"],
+                       "fine": t["fine"], "luogo": t.get("luogo", ""), "url": PAGINA_TORNEO.format(id=t["id"]),
+                       "stato": stato, "incontri": per_torneo.get(t["nome"], 0),
+                       "attesi": incontri_attesi(tab, t["categoria"])})
+    nomi = {t["nome"] for t in elenco}
     incontri = [[r.get("torneo", ""), r.get("disciplina", ""), r.get("turno", ""), r.get("p1", ""), r.get("noc1", ""),
-                 r.get("p2", ""), r.get("noc2", ""), r.get("score", ""), r.get("data", ""), r.get("tabellone", ""),
-                 r.get("id1", ""), r.get("id2", "")] for r in righe]
+                 r.get("p2", ""), r.get("noc2", ""), r.get("score", ""), r.get("data", "")]
+                for r in righe if r.get("torneo", "") in nomi]
     pos = {n: i for i, n in enumerate(ORDINE_TURNI)}
     incontri.sort(key=lambda x: (x[0], ORDINE_SPEC.index(x[1]) if x[1] in ORDINE_SPEC else 9, pos.get(x[2], 99), x[8]))
-    return {"aggiornato": oggi.isoformat(), "versione": "1.3",
+    return {"aggiornato": oggi.isoformat(), "versione": VERSIONE,
+            "stagioni": sorted({t["inizio"][:4] for t in elenco if t["inizio"]}),
             "campi": ["torneo", "disciplina", "turno", "vincitore", "noc_vincitore", "sconfitto", "noc_sconfitto",
-                      "punteggio", "data", "tabellone", "id_vincitore", "id_sconfitto"],
-            "tornei": elenco, "incontri": incontri}
+                      "punteggio", "data"],
+            "tornei": elenco, "incontri": incontri, "campi_casella": CAMPI_CASELLA,
+            "tabelloni": {k: v for k, v in sorted(tabelloni.items()) if k in nomi}}
 
+
+# ------------------------------------------------------------------ pubblicazione su map-q-la28 (novità 1.4)
+def gh_headers(accept="application/vnd.github+json"):
+    """Intestazioni per l'API di GitHub (senza MAPPA_TOKEN si legge lo stesso: il repo è pubblico)."""
+    h = {"Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
+    if MAPPA_TOKEN:
+        h["Authorization"] = f"Bearer {MAPPA_TOKEN}"
+    return h
+
+
+def leggi_json_pubblicato():
+    """Il tennistavolo.json già pubblicato su map-q-la28: (sha, contenuto) oppure (None, None).
+    Il file supera 1 MB: prima chiedo lo «sha» (serve per sovrascriverlo), poi il contenuto in versione
+    «grezza» (raw), che l'API di GitHub dà fino a 100 MB (stesso sistema del badminton)."""
+    if WTT_LOCALE:
+        return None, None
+    url = f"https://api.github.com/repos/{MAPPA_REPO}/contents/{FILE_WEB}"
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    if r.status_code == 404:
+        return None, None
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub ha risposto {r.status_code}: {r.text[:300]}")
+    sha = r.json().get("sha")
+    r = requests.get(url, headers=gh_headers("application/vnd.github.raw+json"), timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub non dà il contenuto di {FILE_WEB}: {r.status_code}")
+    try:
+        return sha, json.loads(r.content.decode("utf-8"))
+    except ValueError:
+        return sha, None
+
+
+def pubblica(payload):
+    """Scrive tennistavolo.json su map-q-la28 e fa ripartire la pubblicazione del sito."""
+    url = f"https://api.github.com/repos/{MAPPA_REPO}/contents/{FILE_WEB}"
+    testo = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    sha, vecchio = leggi_json_pubblicato()
+    if vecchio and {**vecchio, "aggiornato": ""} == {**payload, "aggiornato": ""}:
+        print("Pagina web: nessuna novità, non la ripubblico.")
+        return
+    corpo = {"message": "Aggiorna i risultati del tennistavolo",
+             "content": base64.b64encode(testo.encode("utf-8")).decode("ascii")}
+    if sha:
+        corpo["sha"] = sha
+    r = requests.put(url, headers=gh_headers(), json=corpo, timeout=180)
+    if not r.ok:
+        raise RuntimeError(f"GitHub non accetta {FILE_WEB}: {r.status_code} {r.text[:300]}")
+    r = requests.post(f"https://api.github.com/repos/{MAPPA_REPO}/actions/workflows/{MAPPA_WORKFLOW}/dispatches",
+                      headers=gh_headers(), json={"ref": "main"}, timeout=30)
+    if r.status_code != 204:
+        print(f"  Attenzione: {FILE_WEB} salvato, ma la ripubblicazione non è partita ({r.status_code}). "
+              "Lancia a mano «Aggiorna mappa LA28» su map-q-la28.")
+    else:
+        print(f"Pagina web: {FILE_WEB} aggiornato ({len(testo) // 1024} KB), ripubblicazione avviata.")
 
 # ------------------------------------------------------------------ programma principale
 def main():
     oggi = date.today()
-    print(f"Agente Tennis Tavolo 1.3 · {datetime.now():%d/%m/%Y %H:%M} · "
+    print(f"Agente Tennis Tavolo {VERSIONE} · {datetime.now():%d/%m/%Y %H:%M} · "
           f"{'SOLO PROVA (non scrivo nulla)' if DRY_RUN else 'lancio vero'} · modalità {MODALITA}")
     if MODALITA not in ("aggiungi", "completa"):
         muori("MODALITA deve essere «aggiungi» o «completa».")
@@ -709,11 +1174,32 @@ def main():
                            "«completa» per recuperarla (scrive solo le righe che mancano).")
         print(f"  scritte: {sum(1 for x in nuove if x['id'] in gia)} su {len(nuove)}")
 
-    # 4. File per la pagina web (solo negli Artifacts del lancio, per ora)
-    with open(FILE_WEB, "w", encoding="utf-8") as f:
-        json.dump(file_web(tornei, righe_web, oggi), f, ensure_ascii=False, separators=(",", ":"))
+    # 4. Tabelloni ufficiali (novità 1.4): dal sito WTT solo quelli che possono essere cambiati,
+    #    gli altri dal tennistavolo.json già pubblicato; poi i gironi dalle righe di Notion
+    try:
+        _, pubblicato = leggi_json_pubblicato()
+    except (RuntimeError, requests.RequestException) as e:
+        pubblicato = None
+        avviso(f"non riesco a rileggere {FILE_WEB} da GitHub ({e}): rileggo tutti i tabelloni")
+    vecchi = (pubblicato or {}).get("tabelloni") or {}
+    tabelloni = tabelloni_aggiornati(tornei, vecchi, oggi)
+    aggiungi_gironi(tabelloni, righe_web)
 
-    # 5. Riepilogo
+    # 5. File per la pagina web: sempre negli Artifacts; nel lancio vero anche su map-q-la28
+    payload = file_web(tornei, righe_web, oggi, tabelloni)
+    with open(FILE_WEB, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    pubblicata = "no (prova)" if DRY_RUN else "no (manca MAPPA_TOKEN)"
+    if not DRY_RUN and MAPPA_TOKEN:
+        try:
+            pubblica(payload)
+            pubblicata = "sì"
+        except (RuntimeError, requests.RequestException) as e:
+            print(f"Pagina web non aggiornata: {e}")
+            pubblicata = "NO, errore (vedi sopra)"
+            errori += 1
+
+    # 6. Riepilogo
     print("\n=================== RIEPILOGO ===================")
     print(f"Tornei saltati perché già completi in Notion: {saltati}")
     print(f"Tornei conclusi ma non ancora archiviati dal sito: {non_archiviati}")
@@ -725,7 +1211,8 @@ def main():
         print("PROVA: nessuna scrittura. Con il lancio vero verrebbero scritte le righe nuove qui sopra.")
     else:
         print(f"Righe scritte in Notion: {scritte} · errori: {errori}")
-    print(f"{FILE_WEB}: {len(righe_web)} incontri (negli Artifacts del lancio)")
+    print(f"{FILE_WEB}: {len(payload['incontri'])} incontri, {len(payload['tornei'])} tornei, "
+          f"{len(payload['tabelloni'])} tornei con tabellone · pubblicato su map-q-la28: {pubblicata}")
     if AVVISI:
         print(f"\nAvvisi ({len(AVVISI)}):")
         for a in AVVISI:
