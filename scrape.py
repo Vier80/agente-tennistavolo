@@ -1,4 +1,12 @@
-"""Agente Tennis Tavolo (versione 1.0 del 19/11/2026, scheda 41)
+"""Agente Tennis Tavolo (versione 1.1 del 19/11/2026, scheda 41)
+
+NOVITÀ della 1.1 (dopo la prima «Solo prova» su GitHub, in cui tutti gli archivi risultavano assenti):
+  - le richieste al sito imitano un browser vero (intestazioni complete);
+  - ogni file si cerca su DUE indirizzi del sito (con e senza memoria cache);
+  - un rifiuto del sito (403, 5xx, pagina non JSON) NON è più scambiato per «archivio non pubblicato»:
+    viene segnalato con il codice di risposta, e il lancio diventa rosso;
+  - all'inizio una DIAGNOSTICA prova un archivio sicuramente presente (Europe Smash 2026) e stampa
+    cosa risponde ogni indirizzo.
 
 Legge dal sito ufficiale WTT (World Table Tennis) i risultati incontro per incontro dei tornei
   Smash, Champions, Star Contender, Contender, WTT Finals, Mondiali e World Cup
@@ -53,19 +61,35 @@ NOMI_ESCLUSI = ("youth", "para ", "veteran", "junior", "masters")
 GIRONI_PRINCIPALI = {"WTT Finals", "World Cup", "Mondiali"}
 
 # Indirizzi del sito WTT (servizi JSON pubblici usati dal sito stesso, nessun login)
-WTT = "https://wtt-web-frontdoor-cthahjeqhbh6aqe3.a01.azurefd.net"
-CALENDARI = [  # si prova il primo; se non c'è, il secondo (il 2025 è solo nel secondo)
+WTT = "https://wtt-web-frontdoor-cthahjeqhbh6aqe3.a01.azurefd.net"                  # con memoria cache
+WTT_SENZA_CACHE = "https://wtt-web-frontdoor-withoutcache-cqakg0andqf5hchn.a01.azurefd.net"  # senza cache
+CALENDARI = [  # si provano in quest'ordine (il 2025 è solo nell'ultimo)
     WTT + "/websitestaticapifiles/general/{anno}_eventcalendar.json",
+    WTT_SENZA_CACHE + "/websitestaticapifiles/general/{anno}_eventcalendar.json",
     "https://www.worldtabletennis.com/assets/json/{anno}_eventcalendar.json",
 ]
-ARCHIVIO = WTT + "/websitearchivedresults/{id}/officialresult/officialresult.json"
+ARCHIVI = [  # stesso file su due indirizzi: verificato dal browser il 19/11/2026
+    WTT + "/websitearchivedresults/{id}/officialresult/officialresult.json",
+    WTT_SENZA_CACHE + "/websitearchivedresults/{id}/officialresult/officialresult.json",
+]
+ID_DIAGNOSTICA = 3246   # Europe Smash 2026: archivio sicuramente presente (307 incontri)
 PAGINA_TORNEO = "https://www.worldtabletennis.com/eventInfo?eventId={id}&selectedTab=Results"
+# Intestazioni come quelle di Chrome quando il sito worldtabletennis.com chiede i suoi file
 WEB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AgenteTennisTavolo/1.0; uso personale)",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/131.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
     "Origin": "https://www.worldtabletennis.com",
     "Referer": "https://www.worldtabletennis.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
 }
+
+
+class SitoRifiuta(Exception):
+    """Il sito WTT ha risposto, ma non con il file: rifiuto (403), errore (5xx) o pagina non JSON."""
 PAUSA_SITO = 1.0      # secondi di pausa tra una richiesta e l'altra al sito WTT
 PAUSA_NOTION = 0.35   # secondi di pausa tra una scrittura e l'altra su Notion
 LIMITE_NOTION = 10000  # oltre questo numero di righe una ricerca di Notion non va (schede 29-30)
@@ -128,9 +152,35 @@ def tempo_scaduto():
 
 
 # ------------------------------------------------------------------ sito WTT
-def scarica(url, nome_locale=None):
-    """Scarica un file JSON dal sito WTT. Restituisce None se il file non esiste (404,
-    o risposta non JSON, come l'errore XML che il sito dà per i calendari mancanti).
+def chiedi(url):
+    """Una richiesta al sito WTT (con 3 tentativi se la rete cade).
+    Restituisce (codice di risposta, dati JSON oppure None, descrizione breve della risposta)."""
+    for tentativo in range(3):
+        try:
+            r = requests.get(url, headers=WEB_HEADERS, timeout=90)
+            time.sleep(PAUSA_SITO)
+            break
+        except requests.RequestException as e:
+            if tentativo == 2:
+                return 0, None, f"rete: {type(e).__name__}"
+            time.sleep(5)
+    tipo = (r.headers.get("Content-Type") or "").split(";")[0]
+    inizio = r.text[:80].replace("\n", " ") if r.content else ""
+    descrizione = f"{r.status_code} {tipo} «{inizio}»"
+    if r.status_code != 200:
+        return r.status_code, None, descrizione
+    try:
+        return 200, r.json(), descrizione
+    except ValueError:
+        return 200, None, descrizione       # risposta 200 ma non JSON (es. errore XML)
+
+
+def scarica(urls, nome_locale=None):
+    """Scarica un file JSON dal sito WTT, provando gli indirizzi in ordine.
+    - Restituisce i dati al primo indirizzo che li dà.
+    - Restituisce None se il file NON ESISTE (404, o l'errore XML «BlobNotFound» del sito).
+    - Solleva SitoRifiuta se il sito risponde in altro modo (403, 5xx, rete): così un blocco
+      dei server di GitHub non viene scambiato per «archivio non pubblicato».
     Con WTT_LOCALE (collaudi) legge invece il file nome_locale da quella cartella."""
     if WTT_LOCALE:
         percorso = os.path.join(WTT_LOCALE, nome_locale or "")
@@ -138,21 +188,37 @@ def scarica(url, nome_locale=None):
             return None
         with open(percorso, encoding="utf-8") as f:
             return json.load(f)
-    for tentativo in range(3):
-        try:
-            r = requests.get(url, headers=WEB_HEADERS, timeout=60)
-            time.sleep(PAUSA_SITO)
-            if r.status_code in (403, 404):
-                return None
-            r.raise_for_status()
-            try:
-                return r.json()
-            except ValueError:
-                return None            # il sito ha risposto, ma non con dati JSON
-        except requests.RequestException:
-            if tentativo == 2:
-                raise
-            time.sleep(5)
+    problemi = []
+    for url in urls:
+        codice, dati, descrizione = chiedi(url)
+        if dati is not None:
+            return dati
+        non_esiste = codice == 404 or (codice == 200 and "NotFound" in descrizione) \
+            or (codice in (400, 409) and "xml" in descrizione.lower())
+        if not non_esiste:
+            problemi.append(f"{url.split('/')[2].split('.')[0]}: {descrizione}")
+    if problemi:
+        raise SitoRifiuta("; ".join(problemi))
+    return None
+
+
+def diagnostica():
+    """Prova un archivio sicuramente presente su ogni indirizzo e stampa cosa risponde il sito.
+    Restituisce True se almeno un indirizzo dà i dati."""
+    if WTT_LOCALE:
+        return True
+    print(f"\nDiagnostica: archivio di Europe Smash 2026 (id {ID_DIAGNOSTICA}), che esiste di sicuro")
+    riuscito = False
+    for modello in ARCHIVI:
+        url = modello.format(id=ID_DIAGNOSTICA)
+        codice, dati, descrizione = chiedi(url)
+        esito = f"OK, {len(dati)} incontri" if isinstance(dati, list) else "NESSUN DATO"
+        print(f"  {url.split('/')[2]}: {esito} · risposta {descrizione}")
+        riuscito = riuscito or isinstance(dati, list)
+    if not riuscito:
+        avviso("la diagnostica non riesce a leggere l'archivio di prova: il sito WTT rifiuta i server di "
+               "GitHub (vedi i codici qui sopra). Manda il rapporto a Claude.")
+    return riuscito
 
 
 def pulisci_nome_torneo(nome):
@@ -167,11 +233,11 @@ def calendario(oggi):
     """Tornei delle 7 categorie, dal 2025 a oggi, in ordine di data."""
     tornei = {}
     for anno in range(ANNO_INIZIO, oggi.year + 1):
-        dati = None
-        for modello in CALENDARI:
-            dati = scarica(modello.format(anno=anno), f"cal_{anno}.json")
-            if dati:
-                break
+        try:
+            dati = scarica([m.format(anno=anno) for m in CALENDARI], f"cal_{anno}.json")
+        except SitoRifiuta as e:
+            avviso(f"calendario {anno}: il sito WTT non lo dà ({e})")
+            continue
         if not dati:
             avviso(f"calendario {anno} non trovato sul sito WTT")
             continue
@@ -309,7 +375,7 @@ def leggi_incontro(m, t):
 
 def incontri_del_torneo(t):
     """Legge l'archivio del torneo. Restituisce (righe, scarti) oppure (None, None) se non è archiviato."""
-    dati = scarica(ARCHIVIO.format(id=t["id"]), f"ev_{t['id']}.json")
+    dati = scarica([m.format(id=t["id"]) for m in ARCHIVI], f"ev_{t['id']}.json")
     if dati is None:
         return None, None
     righe, scarti = {}, Counter()
@@ -450,7 +516,7 @@ def file_web(tornei, righe, oggi):
                  r.get("id1", ""), r.get("id2", "")] for r in righe]
     pos = {n: i for i, n in enumerate(ORDINE_TURNI)}
     incontri.sort(key=lambda x: (x[0], ORDINE_SPEC.index(x[1]) if x[1] in ORDINE_SPEC else 9, pos.get(x[2], 99), x[8]))
-    return {"aggiornato": oggi.isoformat(), "versione": "1.0",
+    return {"aggiornato": oggi.isoformat(), "versione": "1.1",
             "campi": ["torneo", "disciplina", "turno", "vincitore", "noc_vincitore", "sconfitto", "noc_sconfitto",
                       "punteggio", "data", "tabellone", "id_vincitore", "id_sconfitto"],
             "tornei": elenco, "incontri": incontri}
@@ -459,7 +525,7 @@ def file_web(tornei, righe, oggi):
 # ------------------------------------------------------------------ programma principale
 def main():
     oggi = date.today()
-    print(f"Agente Tennis Tavolo 1.0 · {datetime.now():%d/%m/%Y %H:%M} · "
+    print(f"Agente Tennis Tavolo 1.1 · {datetime.now():%d/%m/%Y %H:%M} · "
           f"{'SOLO PROVA (non scrivo nulla)' if DRY_RUN else 'lancio vero'} · modalità {MODALITA}")
     if MODALITA not in ("aggiungi", "completa"):
         muori("MODALITA deve essere «aggiungi» o «completa».")
@@ -486,6 +552,12 @@ def main():
     print(f"\nTornei in calendario dal {ANNO_INIZIO}: {len(tornei)} ("
           + ", ".join(f"{c} {conta_cat[c]}" for c in CATEGORIE.values() if conta_cat[c]) + ")")
 
+    # 2b. Diagnostica: se il sito non dà nemmeno l'archivio di prova, inutile continuare
+    if not diagnostica():
+        print("\nMi fermo: senza accesso agli archivi non posso leggere nessun torneo.")
+        print("Avvisi:\n  - " + "\n  - ".join(AVVISI))
+        sys.exit(1)
+
     # 3. Tornei conclusi: lettura dell'archivio e scrittura in Notion
     nuove_tot = scritte = errori = saltati = non_archiviati = 0
     scarti_tot, per_tabellone = Counter(), Counter()
@@ -502,8 +574,8 @@ def main():
         print(f"\n{t['categoria']} · {t['nome']} ({t['inizio']} – {t['fine']}) · id {t['id']}")
         try:
             righe, scarti = incontri_del_torneo(t)
-        except requests.RequestException as e:
-            avviso(f"{t['nome']}: sito WTT non raggiungibile ({e})")
+        except SitoRifiuta as e:
+            avviso(f"{t['nome']}: il sito WTT non dà l'archivio ({e})")
             errori += 1
             continue
         if righe is None:
