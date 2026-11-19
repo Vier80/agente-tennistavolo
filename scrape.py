@@ -1,4 +1,8 @@
-"""Agente Tennis Tavolo (versione 1.1 del 19/11/2026, scheda 41)
+"""Agente Tennis Tavolo (versione 1.2 del 19/11/2026, scheda 41)
+
+NOVITÀ della 1.2 (seconda «Solo prova»: il sito rispondeva 200 ma con il file compresso Brotli):
+  - apre i file compressi Brotli (nuovo pacchetto «brotli» in requirements.txt), gzip e zlib;
+  - la diagnostica distingue «risposta ricevuta ma non leggibile» da «rifiuto del sito».
 
 NOVITÀ della 1.1 (dopo la prima «Solo prova» su GitHub, in cui tutti gli archivi risultavano assenti):
   - le richieste al sito imitano un browser vero (intestazioni complete);
@@ -30,15 +34,22 @@ Variabili (i «Secrets» e le scelte del workflow di GitHub):
   TEMPO_MAX_MINUTI    dopo quanti minuti smettere di scrivere e chiudere in ordine (predefinito 110)
   WTT_LOCALE          SOLO PER I COLLAUDI: cartella con file già scaricati al posto del sito
 """
+import gzip
 import json
 import os
 import re
 import sys
 import time
+import zlib
 from collections import Counter
 from datetime import date, datetime
 
 import requests
+
+try:
+    import brotli          # pacchetto per aprire i file compressi Brotli (in requirements.txt)
+except ImportError:
+    brotli = None
 
 # ------------------------------------------------------------------ impostazioni
 ANNO_INIZIO = 2025
@@ -79,6 +90,7 @@ WEB_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/131.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
     "Origin": "https://www.worldtabletennis.com",
     "Referer": "https://www.worldtabletennis.com/",
@@ -165,14 +177,50 @@ def chiedi(url):
                 return 0, None, f"rete: {type(e).__name__}"
             time.sleep(5)
     tipo = (r.headers.get("Content-Type") or "").split(";")[0]
-    inizio = r.text[:80].replace("\n", " ") if r.content else ""
-    descrizione = f"{r.status_code} {tipo} «{inizio}»"
+    compressione = r.headers.get("Content-Encoding") or "nessuna"
+    inizio = testo_leggibile(r.content)[:80].replace("\n", " ")
+    descrizione = f"{r.status_code} {tipo} (compressione: {compressione}) «{inizio}»"
     if r.status_code != 200:
         return r.status_code, None, descrizione
+    dati = decodifica(r.content)
+    return 200, dati, descrizione            # dati = None se la risposta non è JSON (es. errore XML)
+
+
+def apri_compressione(contenuto):
+    """Restituisce il contenuto decompresso (Brotli, gzip o zlib) oppure quello originale."""
+    for apri in ([brotli.decompress] if brotli else []) + [gzip.decompress, zlib.decompress]:
+        try:
+            return apri(contenuto)
+        except Exception:
+            continue
+    return contenuto
+
+
+def testo_leggibile(contenuto):
+    """L'inizio della risposta come testo, decompresso se serve (per il registro e per riconoscere
+    l'errore XML «BlobNotFound» anche quando arriva compresso)."""
     try:
-        return 200, r.json(), descrizione
-    except ValueError:
-        return 200, None, descrizione       # risposta 200 ma non JSON (es. errore XML)
+        return contenuto.decode("utf-8")
+    except UnicodeDecodeError:
+        return apri_compressione(contenuto).decode("utf-8", errors="replace")
+
+
+def decodifica(contenuto):
+    """Trasforma la risposta del sito in dati JSON.
+    Il sito WTT manda i suoi file COMPRESSI con il formato Brotli (lo stesso che usa il browser),
+    a volte senza dirlo nelle intestazioni: in quel caso la libreria requests non li apre da sola
+    e il testo sembra fatto di caratteri strani («[6CQA…»; prova su GitHub del 19/11/2026).
+    Si prova quindi: testo normale, poi Brotli, poi gzip, poi zlib. None se nessuno funziona."""
+    tentativi = [lambda b: b]
+    if brotli:
+        tentativi.append(brotli.decompress)
+    tentativi += [gzip.decompress, zlib.decompress]
+    for apri in tentativi:
+        try:
+            return json.loads(apri(contenuto).decode("utf-8-sig"))
+        except Exception:                    # formato sbagliato: si prova il successivo
+            continue
+    return None
 
 
 def scarica(urls, nome_locale=None):
@@ -208,14 +256,19 @@ def diagnostica():
     if WTT_LOCALE:
         return True
     print(f"\nDiagnostica: archivio di Europe Smash 2026 (id {ID_DIAGNOSTICA}), che esiste di sicuro")
-    riuscito = False
+    print(f"  pacchetto brotli: {'presente' if brotli else 'MANCANTE (controlla requirements.txt)'}")
+    riuscito, risposte_200 = False, 0
     for modello in ARCHIVI:
         url = modello.format(id=ID_DIAGNOSTICA)
         codice, dati, descrizione = chiedi(url)
         esito = f"OK, {len(dati)} incontri" if isinstance(dati, list) else "NESSUN DATO"
         print(f"  {url.split('/')[2]}: {esito} · risposta {descrizione}")
         riuscito = riuscito or isinstance(dati, list)
-    if not riuscito:
+        risposte_200 += codice == 200
+    if not riuscito and risposte_200:
+        avviso("la diagnostica riceve l'archivio di prova (risposta 200) ma non riesce ad aprirlo "
+               "(formato o compressione sconosciuti). Manda il rapporto a Claude.")
+    elif not riuscito:
         avviso("la diagnostica non riesce a leggere l'archivio di prova: il sito WTT rifiuta i server di "
                "GitHub (vedi i codici qui sopra). Manda il rapporto a Claude.")
     return riuscito
@@ -516,7 +569,7 @@ def file_web(tornei, righe, oggi):
                  r.get("id1", ""), r.get("id2", "")] for r in righe]
     pos = {n: i for i, n in enumerate(ORDINE_TURNI)}
     incontri.sort(key=lambda x: (x[0], ORDINE_SPEC.index(x[1]) if x[1] in ORDINE_SPEC else 9, pos.get(x[2], 99), x[8]))
-    return {"aggiornato": oggi.isoformat(), "versione": "1.1",
+    return {"aggiornato": oggi.isoformat(), "versione": "1.2",
             "campi": ["torneo", "disciplina", "turno", "vincitore", "noc_vincitore", "sconfitto", "noc_sconfitto",
                       "punteggio", "data", "tabellone", "id_vincitore", "id_sconfitto"],
             "tornei": elenco, "incontri": incontri}
@@ -525,7 +578,7 @@ def file_web(tornei, righe, oggi):
 # ------------------------------------------------------------------ programma principale
 def main():
     oggi = date.today()
-    print(f"Agente Tennis Tavolo 1.1 · {datetime.now():%d/%m/%Y %H:%M} · "
+    print(f"Agente Tennis Tavolo 1.2 · {datetime.now():%d/%m/%Y %H:%M} · "
           f"{'SOLO PROVA (non scrivo nulla)' if DRY_RUN else 'lancio vero'} · modalità {MODALITA}")
     if MODALITA not in ("aggiungi", "completa"):
         muori("MODALITA deve essere «aggiungi» o «completa».")
