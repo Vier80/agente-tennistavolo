@@ -1,0 +1,55 @@
+name: Agente Tennis Tavolo
+
+# Repo agente-tennistavolo, file .github/workflows/agente.yml (versione 1.0 del 19/11/2026, scheda 41).
+# Parte in due modi:
+#   - a mano: Actions -> Agente Tennis Tavolo -> Run workflow (con le scelte qui sotto);
+#   - ogni mattina da cron-job.org, con il corpo {"ref":"main"}: valgono i valori predefiniti,
+#     cioè lancio vero (prova = no) e modalità "aggiungi".
+# L'avvio del calcolo ELO del lunedì si aggiungerà nella sessione 3 (come nel badminton).
+on:
+  workflow_dispatch:
+    inputs:
+      prova:
+        description: "Solo prova (legge il sito WTT e Notion, ma non scrive nulla)"
+        type: boolean
+        default: false
+      modalita:
+        description: "aggiungi = salta i tornei già completi; completa = rilegge tutti i tornei e scrive solo le righe mancanti"
+        type: choice
+        options: ["aggiungi", "completa"]
+        default: "aggiungi"
+
+concurrency:
+  group: agente-tennistavolo   # mai due esecuzioni insieme: il secondo lancio aspetta il primo
+  cancel-in-progress: false
+
+jobs:
+  aggiorna:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130       # lo script smette di scrivere da solo a 110 minuti e chiude in ordine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Leggi i risultati WTT e scrivi su Notion
+        # "shell: bash" fa sì che un errore dello script colori di rosso il lancio anche con "tee"
+        shell: bash
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          DRY_RUN: ${{ inputs.prova }}
+          MODALITA: ${{ inputs.modalita }}
+          TEMPO_MAX_MINUTI: "110"
+        # "tee" scrive il registro a video e, insieme, nel file rapporto_tennistavolo.txt
+        run: python -u scrape.py | tee rapporto_tennistavolo.txt
+      - name: Conserva il rapporto (Artifacts in fondo alla pagina del lancio)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapporto-tennistavolo
+          path: |
+            rapporto_tennistavolo.txt
+            tennistavolo.json
+          if-no-files-found: ignore
