@@ -1,4 +1,9 @@
-"""Agente Tennis Tavolo (versione 1.2 del 19/11/2026, scheda 41)
+"""Agente Tennis Tavolo (versione 1.3 del 19/11/2026, scheda 41)
+
+NOVITÀ della 1.3 (terza «Solo prova»: 9.771 incontri letti): controllo di coerenza su ogni incontro.
+  Si scarta, con un avviso, l'incontro in cui la scheda del sito non corrisponde al codice
+  (specialità diversa, numero di giocatori sbagliato, data prima dell'inizio del torneo):
+  nell'archivio di Europe Smash 2026 il sito ha messo 3 partite di un altro torneo.
 
 NOVITÀ della 1.2 (seconda «Solo prova»: il sito rispondeva 200 ma con il file compresso Brotli):
   - apre i file compressi Brotli (nuovo pacchetto «brotli» in requirements.txt), gzip e zlib;
@@ -109,6 +114,9 @@ LIMITE_NOTION = 10000  # oltre questo numero di righe una ricerca di Notion non 
 # Specialità: caratteri 4-11 del documentCode -> sigla
 SPECIALITA = {"MSINGLES": "MS", "WSINGLES": "WS", "MDOUBLES": "MD", "WDOUBLES": "WD", "XDOUBLES": "XD"}
 GENDER = {"MS": "Men", "MD": "Men", "WS": "Women", "WD": "Women", "XD": "Mixed"}
+# Come il sito chiama ogni specialità nella scheda dell'incontro (subEventName): serve al controllo di coerenza
+NOMI_SPECIALITA = {"MS": "Men's Singles", "WS": "Women's Singles", "MD": "Men's Doubles",
+                   "WD": "Women's Doubles", "XD": "Mixed Doubles"}
 ORDINE_SPEC = ["MS", "WS", "MD", "WD", "XD"]
 
 # Turni del tabellone principale: caratteri 23-26 del documentCode -> valore di «Turno»
@@ -390,6 +398,23 @@ def leggi_incontro(m, t):
     ospite = next((c for c in comps if c.get("competitorType") == "A"), None)
     if not casa or not ospite:
         return None, "manca uno dei due lati"
+    # Controllo di coerenza (novità 1.3): nell'archivio di Europe Smash 2026 il sito ha messo, sotto il codice
+    # di 3 partite di Malmö, partite di un altro torneo (altra specialità, giocatori sbagliati, data precedente).
+    incoerenza = None
+    descrizione = (mc.get("subEventName") or mc.get("subEventDescription") or "").strip()
+    if descrizione and not descrizione.lower().startswith(NOMI_SPECIALITA[spec].lower()):
+        incoerenza = f"la scheda dice «{descrizione}»"
+    elif any(len(c.get("players") or []) != (2 if spec in ("MD", "WD", "XD") else 1) for c in (casa, ospite)):
+        incoerenza = "numero di giocatori sbagliato per la specialità"
+    else:
+        giorno_scheda = data_iso((mc.get("matchDateTime") or {}).get("startDateLocal"))
+        if giorno_scheda and t.get("inizio") and \
+                (date.fromisoformat(t["inizio"]) - date.fromisoformat(giorno_scheda)).days > 1:
+            incoerenza = f"data {giorno_scheda} prima dell'inizio del torneo"
+    if incoerenza:
+        avviso(f"{t['nome']}: scartato {codice.rstrip('-')} ({casa.get('competitiorName')} – "
+               f"{ospite.get('competitiorName')}): dato incoerente del sito, {incoerenza}")
+        return None, "dato incoerente del sito"
     punteggio = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*([A-Za-z]*)", mc.get("overallScores") or "")
     if not punteggio:
         return None, "punteggio non leggibile"
@@ -569,7 +594,7 @@ def file_web(tornei, righe, oggi):
                  r.get("id1", ""), r.get("id2", "")] for r in righe]
     pos = {n: i for i, n in enumerate(ORDINE_TURNI)}
     incontri.sort(key=lambda x: (x[0], ORDINE_SPEC.index(x[1]) if x[1] in ORDINE_SPEC else 9, pos.get(x[2], 99), x[8]))
-    return {"aggiornato": oggi.isoformat(), "versione": "1.2",
+    return {"aggiornato": oggi.isoformat(), "versione": "1.3",
             "campi": ["torneo", "disciplina", "turno", "vincitore", "noc_vincitore", "sconfitto", "noc_sconfitto",
                       "punteggio", "data", "tabellone", "id_vincitore", "id_sconfitto"],
             "tornei": elenco, "incontri": incontri}
@@ -578,7 +603,7 @@ def file_web(tornei, righe, oggi):
 # ------------------------------------------------------------------ programma principale
 def main():
     oggi = date.today()
-    print(f"Agente Tennis Tavolo 1.2 · {datetime.now():%d/%m/%Y %H:%M} · "
+    print(f"Agente Tennis Tavolo 1.3 · {datetime.now():%d/%m/%Y %H:%M} · "
           f"{'SOLO PROVA (non scrivo nulla)' if DRY_RUN else 'lancio vero'} · modalità {MODALITA}")
     if MODALITA not in ("aggiungi", "completa"):
         muori("MODALITA deve essere «aggiungi» o «completa».")
