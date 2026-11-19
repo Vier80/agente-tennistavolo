@@ -1,11 +1,15 @@
 name: Agente Tennis Tavolo
 
-# Repo agente-tennistavolo, file .github/workflows/agente.yml (versione 1.0 del 19/11/2026, scheda 41).
+# Repo agente-tennistavolo, file .github/workflows/agente.yml (versione 1.1 del 19/11/2026, scheda 43).
 # Parte in due modi:
 #   - a mano: Actions -> Agente Tennis Tavolo -> Run workflow (con le scelte qui sotto);
 #   - ogni mattina da cron-job.org, con il corpo {"ref":"main"}: valgono i valori predefiniti,
-#     cioè lancio vero (prova = no) e modalità "aggiungi".
-# L'avvio del calcolo ELO del lunedì si aggiungerà nella sessione 3 (come nel badminton).
+#     cioè lancio vero (prova = no) e modalità "aggiungi". Su cron-job.org non serve cambiare nulla.
+# NOVITÀ della versione 1.1 (sessione 3, come il badminton):
+#   - lo script riceve MAPPA_TOKEN: pubblica tennistavolo.json (con i tabelloni) nel repo map-q-la28;
+#   - il LUNEDÌ (ora italiana), alla fine del lancio vero, avvia "ELO Tennis Tavolo" nel repo map-q-la28,
+#     che ricalcola l'ELO, lo scrive in Athletes (ELO TT) e fa ripubblicare le pagine.
+#     Negli altri giorni l'ELO non parte (si può forzare con "Avvia comunque il calcolo ELO").
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +22,10 @@ on:
         type: choice
         options: ["aggiungi", "completa"]
         default: "aggiungi"
+      avvia_elo:
+        description: "Avvia comunque il calcolo ELO alla fine (di norma parte da solo solo il lunedì)"
+        type: boolean
+        default: false
 
 concurrency:
   group: agente-tennistavolo   # mai due esecuzioni insieme: il secondo lancio aspetta il primo
@@ -39,6 +47,7 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          MAPPA_TOKEN: ${{ secrets.MAPPA_TOKEN }}     # NOVITÀ 1.1: per pubblicare tennistavolo.json
           DRY_RUN: ${{ inputs.prova }}
           MODALITA: ${{ inputs.modalita }}
           TEMPO_MAX_MINUTI: "110"
@@ -53,3 +62,39 @@ jobs:
             rapporto_tennistavolo.txt
             tennistavolo.json
           if-no-files-found: ignore
+
+      # ------------------------------------------------------------------ NOVITÀ della versione 1.1
+      - name: Il lunedì avvia il calcolo ELO (workflow "ELO Tennis Tavolo" nel repo map-q-la28)
+        # Quando parte:
+        #   - solo nei lanci veri: una prova non ha scritto nulla in Notion. format('{0}', ...) trasforma
+        #     il valore in testo, così la condizione funziona sia a mano sia da cron-job.org;
+        #   - anche se l'agente ha avuto errori parziali: l'ELO si ricalcola da zero sulle righe
+        #     presenti in Notion. "!cancelled()" = sempre, tranne se il lancio è stato annullato a mano.
+        if: ${{ !cancelled() && format('{0}', inputs.prova) != 'true' }}
+        env:
+          # stesso token che lo script usa per pubblicare tennistavolo.json:
+          # deve avere "Actions: Read and write" sul repo map-q-la28
+          GH_TOKEN: ${{ secrets.MAPPA_TOKEN }}
+          FORZA: ${{ inputs.avvia_elo }}
+        run: |
+          # giorno della settimana in Italia: 1 = lunedì ... 7 = domenica
+          giorno=$(TZ=Europe/Rome date +%u)
+          if [ "$giorno" != "1" ] && [ "$FORZA" != "true" ]; then
+            echo "Oggi non è lunedì: il calcolo ELO non parte (si può forzare con 'Avvia comunque il calcolo ELO')."
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ATTENZIONE: il segreto MAPPA_TOKEN non c'è, quindi il calcolo ELO non parte."
+            echo "Lancialo a mano: repo map-q-la28 -> Actions -> ELO Tennis Tavolo -> Run workflow, senza spunta su solo_prova."
+            exit 1
+          fi
+          # "elo-tennistavolo.yml" è il nome del FILE del workflow (più sicuro del titolo, che si può cambiare);
+          # -f solo_prova=false = lancio vero: scrive ELO TT in Athletes e salva tennistavolo-elo.json.
+          if gh workflow run elo-tennistavolo.yml --repo "${{ github.repository_owner }}/map-q-la28" -f solo_prova=false; then
+            echo "Ho avviato 'ELO Tennis Tavolo' nel repo map-q-la28: il calcolo dura di solito pochi minuti."
+          else
+            echo "ATTENZIONE: non sono riuscito ad avviare 'ELO Tennis Tavolo'."
+            echo "Cause probabili: al token MAPPA_TOKEN manca 'Actions: Read and write' su map-q-la28, oppure è scaduto."
+            echo "Intanto lancia 'ELO Tennis Tavolo' a mano, senza spunta su solo_prova."
+            exit 1
+          fi
