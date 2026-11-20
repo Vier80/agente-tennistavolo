@@ -1,4 +1,13 @@
-"""Agente Tennis Tavolo (versione 1.4 del 19/11/2026, scheda 43)
+"""Agente Tennis Tavolo (versione 1.4.1 del 20/11/2026, scheda 43)
+
+NOVITÀ della 1.4.1 (dopo la «Solo prova» della 1.4: 53 tabelloni letti, nessun rifiuto).
+  Nei CONTENDER il sito segna «con gironi» anche il tabellone principale, ma i gironi sono quelli
+  delle QUALIFICAZIONI (in Notion: Turno «Qualifying Group»). La 1.4 li trattava come i gironi delle
+  WTT Finals e la pagina mostrava «gironi + 32» con i gironi vuoti. Ora:
+    - il principale dei Contender è un normale tabellone a eliminazione;
+    - il turno finale delle qualificazioni (dopo i gironi) va nella vista «Qualificazioni»;
+    - i gironi di qualificazione restano nell'Elenco degli incontri.
+  WTT Finals e World Cup (gironi veri nel principale) non cambiano. Notion non cambia.
 
 NOVITÀ della 1.4 (sessione 3: pagina tennistavolo.html). Notion funziona esattamente come nella 1.3.
   1. TABELLONI UFFICIALI: per ogni torneo l'agente legge dal sito WTT il tabellone di ogni specialità
@@ -190,7 +199,7 @@ TEMPO_MAX = float(os.getenv("TEMPO_MAX_MINUTI", "") or 110) * 60
 WTT_LOCALE = os.getenv("WTT_LOCALE", "").strip()
 FILE_WEB = "tennistavolo.json"
 MAPPA_TOKEN = os.getenv("MAPPA_TOKEN", "").strip()       # novità 1.4
-VERSIONE = "1.4"
+VERSIONE = "1.4.1"
 
 NOTION_HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28",
                   "Content-Type": "application/json"}
@@ -789,7 +798,8 @@ def leggi_tabelloni(t):
       - con gironi (WTT Finals, World Cup): {"tipo": "G", ...} con semifinali/finale o ottavi... in "c";
         i gironi ("gironi") si aggiungono dopo, dalle righe di Notion (aggiungi_gironi);
       - qualificazioni a eliminazione, se ci sono: "q": {"misura", "turni", "c"};
-        qualificazioni a gironi: "q_gironi": true (la pagina le mostra solo nell'elenco).
+        qualificazioni a gironi: "q_gironi": true (la pagina le mostra solo nell'elenco); se dopo i gironi
+        c'è un turno finale a eliminazione (Contender, «QER»), quel turno va anche in "q".
     "attesi" = incontri che avrà il torneo = TotalMatchesForSubEvent del sito meno i bye.
     """
     squadre, spec, attesi = Squadre(), {}, 0
@@ -799,15 +809,22 @@ def leggi_tabelloni(t):
             continue
         voce = None
         n = int(dati.get("TotalMatchesForSubEvent") or 0)
-        for blocco in (dati.get("Competition") or {}).get("Bracket") or []:
+        blocchi = (dati.get("Competition") or {}).get("Bracket") or []
+        # Versione 1.4.1: nei Contender il sito mette GroupMatches=true sia nel MAIN sia nel PREL, ma i
+        # gironi sono quelli di QUALIFICAZIONE (in Notion: Turno «Qualifying Group»). Quindi il MAIN ha
+        # i gironi («G») solo se non c'è un PREL con gironi (WTT Finals, World Cup).
+        gironi_in_qualif = any((b.get("Code") or "").upper() == "PREL" and b.get("GroupMatches") for b in blocchi)
+        for blocco in blocchi:
             n -= int(blocco.get("NoOfByes") or 0)
             codice = (blocco.get("Code") or "").upper()
             if codice == "MAIN":
-                voce = {"tipo": "G" if blocco.get("GroupMatches") else "E", **eliminazione(blocco, squadre)}
+                tipo = "G" if blocco.get("GroupMatches") and not gironi_in_qualif else "E"
+                voce = {"tipo": tipo, **eliminazione(blocco, squadre)}
             elif codice == "PREL":
                 if blocco.get("GroupMatches"):
                     spec.setdefault("_q_gironi", set()).add(s)
-                else:
+                # turni a eliminazione delle qualificazioni (anche il turno finale «QER» dopo i gironi)
+                if any(t.get("BracketItem") for t in blocco.get("BracketItems") or []):
                     spec.setdefault("_q", {})[s] = eliminazione(blocco, squadre)
         if voce:
             spec[s] = voce
